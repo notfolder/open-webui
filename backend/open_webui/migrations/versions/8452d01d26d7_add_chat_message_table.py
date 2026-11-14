@@ -23,6 +23,45 @@ depends_on: Union[str, Sequence[str], None] = None
 
 BATCH_SIZE = 5000
 
+# Helper table handed over to revision 9a1b2c3d4e5f (add current_message_id to
+# chat). That revision needs each chat's "current message" candidates, which
+# live in the same chat document this backfill already reads. Recording them
+# here saves it from reading every chat document a second time. It drops the
+# table when it is done, and works without it if the table is absent.
+CURRENT_MESSAGE_HINT_TABLE = 'migration_chat_current_message_hint'
+
+
+def _dumps(value):
+    """
+    Serialize like the application does (ensure_ascii=False), so non-ASCII text
+    is stored as UTF-8 instead of six-byte \\uXXXX escapes. This roughly halves
+    the stored size of CJK text. A value containing an unpaired surrogate cannot
+    be encoded as UTF-8; keep the escaped form for it.
+    """
+    text = json.dumps(value, ensure_ascii=False)
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        text = json.dumps(value)
+    return text
+
+
+class _JSON(sa.types.TypeDecorator):
+    """JSON column whose values are serialized with _dumps()."""
+
+    impl = sa.JSON
+    cache_ok = True
+
+    def bind_processor(self, dialect):
+        return _dumps
+
+
+def _hint_candidate(value, prefix):
+    """A current-message candidate as revision 9a1b2c3d4e5f normalizes it."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[len(prefix) :] if value.startswith(prefix) else value
+
 
 def _flush_batch(conn, table, batch):
     """
@@ -98,6 +137,14 @@ def upgrade() -> None:
         table_args.append(sa.ForeignKeyConstraint(['chat_id'], ['chat.id'], ondelete='CASCADE'))
     op.create_table('chat_message', *table_args)
 
+    op.create_table(
+        CURRENT_MESSAGE_HINT_TABLE,
+        sa.Column('chat_id', sa.Text(), primary_key=True),
+        sa.Column('history_current_id', sa.Text(), nullable=True),
+        sa.Column('chat_current_id', sa.Text(), nullable=True),
+        sa.Column('branch_point_message_id', sa.Text(), nullable=True),
+    )
+
     # Step 2: Backfill from existing chats
     chat_table = sa.table(
         'chat',
@@ -113,19 +160,28 @@ def upgrade() -> None:
         sa.column('user_id', sa.Text()),
         sa.column('role', sa.Text()),
         sa.column('parent_id', sa.Text()),
-        sa.column('content', sa.JSON()),
-        sa.column('output', sa.JSON()),
+        sa.column('content', _JSON()),
+        sa.column('output', _JSON()),
         sa.column('model_id', sa.Text()),
-        sa.column('files', sa.JSON()),
-        sa.column('sources', sa.JSON()),
-        sa.column('embeds', sa.JSON()),
+        sa.column('files', _JSON()),
+        sa.column('sources', _JSON()),
+        sa.column('embeds', _JSON()),
         sa.column('done', sa.Boolean()),
-        sa.column('status_history', sa.JSON()),
-        sa.column('error', sa.JSON()),
-        sa.column('usage', sa.JSON()),
+        sa.column('status_history', _JSON()),
+        sa.column('error', _JSON()),
+        sa.column('usage', _JSON()),
         sa.column('created_at', sa.BigInteger()),
         sa.column('updated_at', sa.BigInteger()),
     )
+
+    hint_table = sa.table(
+        CURRENT_MESSAGE_HINT_TABLE,
+        sa.column('chat_id', sa.Text()),
+        sa.column('history_current_id', sa.Text()),
+        sa.column('chat_current_id', sa.Text()),
+        sa.column('branch_point_message_id', sa.Text()),
+    )
+    hints_batch = []
 
     # Stream rows instead of loading all into memory:
     # - yield_per: fetches rows in chunks via cursor.fetchmany() (all backends)
@@ -157,6 +213,23 @@ def upgrade() -> None:
                 continue
 
         history = chat_data.get('history', {})
+
+        # Record the current-message candidates for revision 9a1b2c3d4e5f
+        prefix = f'{chat_id}-'
+        hints_batch.append(
+            {
+                'chat_id': chat_id,
+                'history_current_id': _hint_candidate(
+                    history.get('currentId') if isinstance(history, dict) else None, prefix
+                ),
+                'chat_current_id': _hint_candidate(chat_data.get('currentId'), prefix),
+                'branch_point_message_id': _hint_candidate(chat_data.get('branchPointMessageId'), prefix),
+            }
+        )
+        if len(hints_batch) >= BATCH_SIZE:
+            conn.execute(sa.insert(hint_table), hints_batch)
+            hints_batch.clear()
+
         if not isinstance(history, dict):
             continue
 
@@ -223,6 +296,9 @@ def upgrade() -> None:
         total_inserted += inserted
         total_failed += failed
 
+    if hints_batch:
+        conn.execute(sa.insert(hint_table), hints_batch)
+
     log.info(f'Backfilled {total_inserted} messages into chat_message table ({total_failed} failed)')
 
     # Step 3: Build the indexes and the foreign key once, over the loaded data
@@ -246,6 +322,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(f'DROP TABLE IF EXISTS {CURRENT_MESSAGE_HINT_TABLE}')
     op.drop_index('chat_message_user_created_idx', table_name='chat_message')
     op.drop_index('chat_message_model_created_idx', table_name='chat_message')
     op.drop_index('chat_message_chat_parent_idx', table_name='chat_message')

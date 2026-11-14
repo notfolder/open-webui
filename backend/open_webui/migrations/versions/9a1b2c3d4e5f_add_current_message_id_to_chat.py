@@ -19,12 +19,39 @@ depends_on: Union[str, Sequence[str], None] = None
 
 BATCH_SIZE = 150
 
+# Written by revision 8452d01d26d7 (see CURRENT_MESSAGE_HINT_TABLE there)
+HINT_TABLE = 'migration_chat_current_message_hint'
+
+# Candidates are tried in the loop's order: history.currentId, chat.currentId,
+# chat.branchPointMessageId. A candidate counts when chat_message has that
+# message for the same chat. The hint values are already normalized (non-empty
+# strings with a leading "<chat id>-" removed).
+_RESOLVE_FROM_HINTS_SQL = f"""
+UPDATE chat
+SET current_message_id = r.message_id
+FROM (
+    SELECT
+        h.chat_id,
+        COALESCE(
+            (SELECT h.history_current_id FROM chat_message m
+             WHERE m.id = h.chat_id || '-' || h.history_current_id AND m.chat_id = h.chat_id),
+            (SELECT h.chat_current_id FROM chat_message m
+             WHERE m.id = h.chat_id || '-' || h.chat_current_id AND m.chat_id = h.chat_id),
+            (SELECT h.branch_point_message_id FROM chat_message m
+             WHERE m.id = h.chat_id || '-' || h.branch_point_message_id AND m.chat_id = h.chat_id)
+        ) AS message_id
+    FROM {HINT_TABLE} h
+) r
+WHERE chat.id = r.chat_id AND r.message_id IS NOT NULL AND r.message_id <> ''
+"""
+
 
 def upgrade() -> None:
     conn = op.get_bind()
     inspector = sa.inspect(conn)
     columns = [col['name'] for col in inspector.get_columns('chat')]
-    if 'current_message_id' not in columns:
+    column_is_new = 'current_message_id' not in columns
+    if column_is_new:
         op.add_column('chat', sa.Column('current_message_id', sa.Text(), nullable=True))
 
     chat = sa.table(
@@ -41,9 +68,32 @@ def upgrade() -> None:
         sa.column('created_at', sa.BigInteger()),
     )
 
-    has_chat_message = 'chat_message' in inspector.get_table_names()
+    table_names = inspector.get_table_names()
+    has_chat_message = 'chat_message' in table_names
+    has_hints = HINT_TABLE in table_names
+
+    # Fast path: revision 8452d01d26d7 recorded each chat's current-message
+    # candidates while it read the chat documents. Use them to resolve, in one
+    # statement, every chat whose candidate exists in chat_message - the first
+    # rule of the loop below, and the one that applies to nearly all chats.
+    # The loop then only reads the documents of the chats still unresolved.
+    #
+    # This matches the loop only when the column was just added: the loop gives
+    # an existing current_message_id the highest priority, and a new column has
+    # none.
+    only_unresolved = False
+    if has_hints and has_chat_message and column_is_new:
+        conn.execute(sa.text(_RESOLVE_FROM_HINTS_SQL))
+        only_unresolved = True
+    if has_hints:
+        op.drop_table(HINT_TABLE)
+
+    query = sa.select(chat.c.id, chat.c.chat, chat.c.current_message_id)
+    if only_unresolved:
+        query = query.where(chat.c.current_message_id.is_(None))
+
     result = conn.execute(
-        sa.select(chat.c.id, chat.c.chat, chat.c.current_message_id).execution_options(
+        query.execution_options(
             yield_per=BATCH_SIZE,
             stream_results=True,
         )
