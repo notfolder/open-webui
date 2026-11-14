@@ -23,8 +23,39 @@ services:
       timeout: 3s
       retries: 30
 
+  # 本物の 0.7.2 を動かして、実際のチャットの形を確かめるためのもの。普段は起動しない。
+  #   起動: docker compose --profile app up -d     画面: http://127.0.0.1:38080
+  # DB は計測用とは別の owui_real を使う（先に CREATE DATABASE owui_real が要る）。
+  openwebui072:
+    image: ghcr.io/open-webui/open-webui:v0.7.2
+    container_name: owui-mig-app072
+    profiles: ["app"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:bench@postgres:5432/owui_real
+      WEBUI_SECRET_KEY: bench
+      ENABLE_OLLAMA_API: "false"
+      OPENAI_API_BASE_URL: http://mockllm:8000/v1
+      OPENAI_API_KEY: mock
+      OFFLINE_MODE: "true"
+    ports:
+      - "127.0.0.1:38080:8080"
+    volumes:
+      - appdata072:/app/backend/data
+
+  mockllm:
+    image: python:3.12-slim
+    container_name: owui-mig-mockllm
+    profiles: ["app"]
+    command: ["python", "/mock_llm.py"]
+    volumes:
+      - ./mock_llm.py:/mock_llm.py:ro
+
 volumes:
   # 名前付きボリュームは OrbStack のデータ領域に置かれる。この Mac ではそれが外付け SSD
   # （/Volumes/SSD/OrbStack/data）なので、内蔵ディスクは使わない。
   # ホストのフォルダを直接マウントすると入出力が遅くなり、計測が実際より遅く出るので使わない。
   pgdata:
+  appdata072:

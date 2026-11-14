@@ -8,7 +8,8 @@
 - 本文は 200〜2,000 文字（日本語と英語とコードの混在）
 - 10% のチャットに、再生成で分かれた枝がある
 - 1% は共有されている（0.7.2 の形式: user_id が "shared-<元の id>" の行をもう 1 行持つ）
-- chat の JSON は 0.7.2 のフロントエンドが保存する形（history.messages と、表示中の枝を並べた messages の両方）
+- chat の JSON は、本物の 0.7.2 を動かして画面から作ったチャットの行に合わせてある
+  （history.messages と、表示中の枝を並べた messages の両方。日本語は \\uXXXX にエスケープされる）
 """
 
 import argparse
@@ -22,6 +23,7 @@ import uuid
 
 import psycopg2
 
+TAGS = ['technology', 'programming', 'database', 'general', 'question', 'docs', 'python', 'sql']
 MODELS = ['gpt-4o', 'claude-sonnet', 'llama3.1:8b', 'gemini-pro', 'qwen2.5:14b']
 
 JA = [
@@ -98,23 +100,31 @@ def make_chat(rng: random.Random, base_ts: int):
         for _ in range(answers):
             aid = new_id(rng)
             ts += rng.randint(2, 60)
+            content = make_text(rng)
+            # 項目と並びは、本物の 0.7.2 の画面が保存した行に合わせてある
+            # （lastSentence は読み上げ用に本文の末尾を複製したもの、followUps は関連質問の候補）
             msg = {
-                'id': aid,
                 'parentId': uid,
+                'id': aid,
                 'childrenIds': [],
                 'role': 'assistant',
-                'content': make_text(rng),
+                'content': content,
                 'model': model,
                 'modelName': model,
                 'modelIdx': 0,
                 'timestamp': ts,
-                'done': True,
+                'lastSentence': content[-rng.randint(60, 200):].replace('\n', ' '),
                 'usage': {
                     'prompt_tokens': rng.randint(50, 4000),
                     'completion_tokens': rng.randint(50, 1500),
                     'total_tokens': rng.randint(100, 5500),
                 },
+                'done': True,
+                'followUps': [make_text(rng, 15, 50).replace('\n', ' ') for _ in range(3)],
             }
+            if rng.random() < 0.02:
+                msg['annotation'] = {'rating': rng.choice([1, -1]), 'tags': ['test']}
+                msg['feedbackId'] = new_id(rng)
             if rng.random() < 0.1:
                 msg['statusHistory'] = [{'done': True, 'action': 'web_search', 'description': 'Searched 3 sites'}]
             if rng.random() < 0.05:
@@ -169,14 +179,16 @@ def worker(args):
             messages += len(chat['history']['messages'])
             chat_id = new_id(rng)
             user_id = f'user-{rng.randrange(users):07d}'
-            body = copy_escape(json.dumps(chat, ensure_ascii=False))
+            # 0.7.2 の本体は json.dumps の既定（ensure_ascii=True）で保存するので、同じ形にする
+            body = copy_escape(json.dumps(chat))
             share_id = new_id(rng) if rng.random() < 0.01 else None
             archived = 't' if rng.random() < 0.02 else 'f'
             pinned = 't' if rng.random() < 0.01 else 'f'
-            row = [chat_id, user_id, copy_escape(title), share_id or '\\N', archived, created, updated, body, pinned, '{}', '\\N']
+            meta = json.dumps({'tags': rng.sample(TAGS, rng.randint(1, 3))}) if rng.random() < 0.8 else '{}'
+            row = [chat_id, user_id, copy_escape(title), share_id or '\\N', archived, created, updated, body, pinned, meta, '\\N']
             buf.write('\t'.join(map(str, row)) + '\n')
             if share_id:
-                row = [share_id, f'shared-{chat_id}', copy_escape(title), '\\N', 'f', updated, updated, body, 'f', '{}', '\\N']
+                row = [share_id, f'shared-{chat_id}', copy_escape(title), '\\N', 'f', created, updated, body, 'f', meta, '\\N']
                 buf.write('\t'.join(map(str, row)) + '\n')
             done += 1
         buf.seek(0)

@@ -5,3 +5,5 @@ v072/
 data/
 logs/
 results/
+test-account.env
+.verify_backup/
