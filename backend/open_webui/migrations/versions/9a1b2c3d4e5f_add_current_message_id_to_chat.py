@@ -22,27 +22,15 @@ BATCH_SIZE = 150
 # Written by revision 8452d01d26d7 (see CURRENT_MESSAGE_HINT_TABLE there)
 HINT_TABLE = 'migration_chat_current_message_hint'
 
-# Candidates are tried in the loop's order: history.currentId, chat.currentId,
-# chat.branchPointMessageId. A candidate counts when chat_message has that
-# message for the same chat. The hint values are already normalized (non-empty
-# strings with a leading "<chat id>-" removed).
+# Each hint is the message the loop's first rule would pick for that chat: the
+# first candidate (history.currentId, chat.currentId, chat.branchPointMessageId)
+# that exists in chat_message. Revision 8452d01d26d7 only writes a hint when it
+# is certain of that.
 _RESOLVE_FROM_HINTS_SQL = f"""
 UPDATE chat
-SET current_message_id = r.message_id
-FROM (
-    SELECT
-        h.chat_id,
-        COALESCE(
-            (SELECT h.history_current_id FROM chat_message m
-             WHERE m.id = h.chat_id || '-' || h.history_current_id AND m.chat_id = h.chat_id),
-            (SELECT h.chat_current_id FROM chat_message m
-             WHERE m.id = h.chat_id || '-' || h.chat_current_id AND m.chat_id = h.chat_id),
-            (SELECT h.branch_point_message_id FROM chat_message m
-             WHERE m.id = h.chat_id || '-' || h.branch_point_message_id AND m.chat_id = h.chat_id)
-        ) AS message_id
-    FROM {HINT_TABLE} h
-) r
-WHERE chat.id = r.chat_id AND r.message_id IS NOT NULL AND r.message_id <> ''
+SET current_message_id = h.message_id
+FROM {HINT_TABLE} h
+WHERE chat.id = h.chat_id
 """
 
 
@@ -72,11 +60,11 @@ def upgrade() -> None:
     has_chat_message = 'chat_message' in table_names
     has_hints = HINT_TABLE in table_names
 
-    # Fast path: revision 8452d01d26d7 recorded each chat's current-message
-    # candidates while it read the chat documents. Use them to resolve, in one
-    # statement, every chat whose candidate exists in chat_message - the first
-    # rule of the loop below, and the one that applies to nearly all chats.
-    # The loop then only reads the documents of the chats still unresolved.
+    # Fast path: revision 8452d01d26d7 recorded each chat's current message
+    # while it backfilled chat_message. Apply those in one statement - they
+    # cover the first rule of the loop below, the one that applies to nearly
+    # all chats. The loop then only reads the documents of the chats still
+    # unresolved.
     #
     # This matches the loop only when the column was just added: the loop gives
     # an existing current_message_id the highest priority, and a new column has
