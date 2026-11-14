@@ -7,3 +7,5 @@ logs/
 results/
 test-account.env
 .verify_backup/
+.matrix_backup.py
+.env

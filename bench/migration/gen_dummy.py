@@ -5,7 +5,7 @@
 
 チャットの形:
 - 1 チャットのメッセージ数は 2〜200 件（対数正規分布、平均は約 20 件）
-- 本文は 200〜2,000 文字（日本語と英語とコードの混在）
+- 本文は 200〜2,000 文字。既定では自然な文章（日本語 6、英語 4）から切り出す（--text、--ja-ratio）
 - 10% のチャットに、再生成で分かれた枝がある
 - 1% は共有されている（0.7.2 の形式: user_id が "shared-<元の id>" の行をもう 1 行持つ）
 - chat の JSON は、本物の 0.7.2 を動かして画面から作ったチャットの行に合わせてある
@@ -55,7 +55,38 @@ CODE = [
 POOL = JA * 6 + EN * 4 + CODE
 
 
+# 本文の作り方。'natural' は、リポジトリにある自然な文章（日本語の画面文言と英語の CHANGELOG）から
+# 連続した範囲を切り出す。'pool' は上の 20 種類ほどの文をつなげる（同じ文が繰り返されるので、
+# PostgreSQL の圧縮が効きすぎる。チャット 1 件で、自然な文章の 0.56 倍の大きさになった）。
+TEXT_MODE = 'natural'
+JA_RATIO = 0.6
+_CORPUS = {}
+
+
+def load_corpus():
+    import os
+    import re
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+    with open(os.path.join(root, 'src/lib/i18n/locales/ja-JP/translation.json')) as f:
+        _CORPUS['ja'] = ' '.join(v for v in json.load(f).values() if v)
+    with open(os.path.join(root, 'CHANGELOG.md')) as f:
+        _CORPUS['en'] = re.sub(r'\[#\d+\]\([^)]*\)|https?://\S+', '', f.read())
+
+
+def _init_worker(text_mode, ja_ratio):
+    global TEXT_MODE, JA_RATIO
+    TEXT_MODE, JA_RATIO = text_mode, ja_ratio
+    if TEXT_MODE == 'natural':
+        load_corpus()
+
+
 def make_text(rng: random.Random, lo: int = 200, hi: int = 2000) -> str:
+    if TEXT_MODE == 'natural':
+        n = rng.randint(lo, hi)
+        src = _CORPUS['ja'] if rng.random() < JA_RATIO else _CORPUS['en']
+        i = rng.randrange(0, max(1, len(src) - n))
+        return src[i : i + n]
     target = rng.randint(lo, hi)
     parts = []
     size = 0
@@ -206,7 +237,13 @@ def main():
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--chunk', type=int, default=200)
+    ap.add_argument('--text', choices=['natural', 'pool'], default='natural', help='本文の作り方（上の TEXT_MODE の説明を参照）')
+    ap.add_argument('--ja-ratio', type=float, default=0.6, help='natural のとき、日本語から切り出す割合')
     a = ap.parse_args()
+    global TEXT_MODE, JA_RATIO
+    TEXT_MODE, JA_RATIO = a.text, a.ja_ratio
+    if TEXT_MODE == 'natural':
+        load_corpus()
     users = a.users or max(10, a.chats // 100)
 
     t0 = time.time()
@@ -235,7 +272,8 @@ def main():
         n = min(per, a.chats - start)
         jobs.append((a.dsn, a.seed, start, n, users, a.chunk))
         start += n
-    with mp.Pool(a.workers) as pool:
+    # macOS では子プロセスが親の変数を引き継がないので、本文の作り方を子プロセスごとに設定し直す
+    with mp.Pool(a.workers, initializer=_init_worker, initargs=(a.text, a.ja_ratio)) as pool:
         results = pool.map(worker, jobs)
     chats = sum(r[0] for r in results)
     messages = sum(r[1] for r in results)

@@ -43,7 +43,11 @@ def main():
     run_db = f'{a.source}_run'
     t0 = time.time()
     admin(f'DROP DATABASE IF EXISTS {run_db} WITH (FORCE)')
-    admin(f'CREATE DATABASE {run_db} TEMPLATE {a.source}')
+    # PostgreSQL 15 以降の既定（WAL_LOG）は、複製する中身をすべて WAL に書くので、大きな DB では遅い。
+    # ファイルを直接コピーする方式を使う。
+    version = int(admin('SHOW server_version_num', fetch=True)[0][0])
+    strategy = ' STRATEGY FILE_COPY' if version >= 150000 else ''
+    admin(f'CREATE DATABASE {run_db} TEMPLATE {a.source}{strategy}')
     copy_seconds = time.time() - t0
     print(f'copied {a.source} -> {run_db} in {copy_seconds:.1f}s', flush=True)
 

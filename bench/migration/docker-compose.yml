@@ -1,8 +1,9 @@
 # マイグレーション計測用の PostgreSQL。
 #   起動: docker compose up -d      停止: docker compose down
 #   データごと消す: docker compose down -v
-# バージョンを変えるときは PG_VERSION を指定する（例: PG_VERSION=15 docker compose up -d）。
-# データの形式はメジャーバージョンごとに違うので、変えるときは down -v で作り直す。
+# バージョンと、データを置くボリュームは、このフォルダの .env で決める（.env.example を参照）。
+# データの形式はメジャーバージョンごとに違うので、バージョンごとに別のボリュームを使う。
+# 切り替えるときは .env を書き換えて docker compose up -d（コンテナは作り直され、もう一方のデータは残る）。
 name: owui-migration-bench
 
 services:
@@ -58,4 +59,5 @@ volumes:
   # （/Volumes/SSD/OrbStack/data）なので、内蔵ディスクは使わない。
   # ホストのフォルダを直接マウントすると入出力が遅くなり、計測が実際より遅く出るので使わない。
   pgdata:
+    name: ${PGDATA_VOLUME:-owui-migration-bench_pgdata}
   appdata072:
