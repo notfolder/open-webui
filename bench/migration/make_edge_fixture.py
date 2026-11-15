@@ -66,6 +66,8 @@ M['content_list'] = msg('content_list', content=[{'type': 'text', 'text': 'こ�
 M['content_null'] = msg('content_null', content=None)
 # NUL 文字を含む本文は、別のチャット（edge-nul）に分けてある。同じチャットに入れると、
 # チャット全体が Python の処理に回り、SQL の処理を確かめられなくなるため。
+# 対になっていないサロゲート（UTF-8 に変換できない文字）。エスケープしたまま書く処理の確認用
+M['content_surrogate'] = msg('content_surrogate', content='a\ud83db')
 M['content_ja'] = msg('content_ja', content='日本語と emoji 🎉 と "引用" と \\ と \n 改行')
 M['full'] = msg('full', role='assistant', model='m', modelName='m', done=True, output=[{'type': 'message'}],
                 files=[{'id': 'f1'}], sources=[{'source': {'name': 'd'}}], embeds=['<iframe>'],

@@ -1,0 +1,2 @@
+ab
+ab-lz4    default_toast_compression=lz4

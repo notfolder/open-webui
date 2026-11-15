@@ -1,0 +1,6 @@
+# 最終版（主キーも後から作る、表示中メッセージを控えて渡す）で、共有バッファを変える。式を作るための点。
+fin-sb3g
+fin-sb8g   shared_buffers=8GB
+fin-sb1g   shared_buffers=1GB
+fin-sb512m shared_buffers=512MB
+fin-sb256m shared_buffers=256MB
