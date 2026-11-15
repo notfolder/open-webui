@@ -23,14 +23,75 @@ depends_on: Union[str, Sequence[str], None] = None
 
 BATCH_SIZE = 5000
 
+# Helper table handed over to revision 9a1b2c3d4e5f (add current_message_id to
+# chat). That revision needs each chat's "current message", which this backfill
+# can decide while it has the chat document and its messages at hand. Recording
+# it here saves that revision from reading every chat document a second time
+# and from looking every candidate up in chat_message. It drops the table when
+# it is done, and works without it if the table is absent.
+CURRENT_MESSAGE_HINT_TABLE = 'migration_chat_current_message_hint'
 
-def _flush_batch(conn, table, batch):
+# Chats that had a message rejected (or removed as a duplicate) get no hint, so
+# revision 9a1b2c3d4e5f works them out itself. If that ever concerns more chats
+# than this, something is systematically wrong: discard every hint.
+MAX_UNCERTAIN_CHATS = 50000
+
+# PostgreSQL: remove later copies of a duplicated message id, keeping the row
+# that was inserted first - the one a primary key would have let in.
+_PG_REMOVE_DUPLICATES_SQL = """
+DELETE FROM chat_message
+WHERE ctid IN (
+    SELECT ctid
+    FROM (
+        SELECT ctid, row_number() OVER (PARTITION BY id ORDER BY ctid) AS position
+        FROM chat_message
+    ) numbered
+    WHERE position > 1
+)
+RETURNING chat_id
+"""
+
+
+def _dumps(value):
+    """
+    Serialize like the application does (ensure_ascii=False), so non-ASCII text
+    is stored as UTF-8 instead of six-byte \\uXXXX escapes. This roughly halves
+    the stored size of CJK text. A value containing an unpaired surrogate cannot
+    be encoded as UTF-8; keep the escaped form for it.
+    """
+    text = json.dumps(value, ensure_ascii=False)
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        text = json.dumps(value)
+    return text
+
+
+class _JSON(sa.types.TypeDecorator):
+    """JSON column whose values are serialized with _dumps()."""
+
+    impl = sa.JSON
+    cache_ok = True
+
+    def bind_processor(self, dialect):
+        return _dumps
+
+
+def _hint_candidate(value, prefix):
+    """A current-message candidate as revision 9a1b2c3d4e5f normalizes it."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[len(prefix) :] if value.startswith(prefix) else value
+
+
+def _flush_batch(conn, table, batch, uncertain_chats):
     """
     Insert a batch of messages, falling back to row-by-row on error.
 
     Tries a single bulk insert first (fast path). If that fails (e.g. due to
     a duplicate key), falls back to individual inserts wrapped in savepoints
-    so the rest of the batch can still succeed.
+    so the rest of the batch can still succeed. Chats that had a message
+    rejected are added to uncertain_chats.
     """
     savepoint = conn.begin_nested()
     try:
@@ -51,6 +112,7 @@ def _flush_batch(conn, table, batch):
             except Exception as e:
                 sp.rollback()
                 failed += 1
+                uncertain_chats.add(msg['chat_id'])
                 log.warning(f'Failed to insert message {msg["id"]}: {e}')
         return inserted, failed
 
@@ -65,18 +127,23 @@ def upgrade() -> None:
 
     # Step 1: Create table
     #
-    # The secondary indexes and the foreign key are added after the backfill
-    # (Step 3). Maintaining them row by row during a large backfill multiplies
-    # the amount of data and WAL written; building them once at the end is much
-    # cheaper. The primary key stays, because the backfill relies on it to
-    # reject duplicate message ids.
+    # The indexes and the foreign key are added after the backfill (Step 3).
+    # Maintaining them row by row during a large backfill means random reads
+    # and writes all over each index once it no longer fits in memory; building
+    # them once at the end, from sorted data, is much cheaper.
+    #
+    # On PostgreSQL this includes the primary key. Its job during the backfill
+    # is to reject a duplicated message id; Step 3 removes such duplicates
+    # before creating it, keeping the row inserted first, which gives the same
+    # result. Other databases keep the primary key from the start.
     #
     # SQLite cannot add a foreign key to an existing table, so there the
     # constraint is declared inline as before.
     is_sqlite = conn.dialect.name == 'sqlite'
+    is_postgresql = conn.dialect.name == 'postgresql'
 
     table_args = [
-        sa.Column('id', sa.Text(), primary_key=True),
+        sa.Column('id', sa.Text(), primary_key=not is_postgresql, nullable=False),
         sa.Column('chat_id', sa.Text(), nullable=False),
         sa.Column('user_id', sa.Text()),
         sa.Column('role', sa.Text(), nullable=False),
@@ -98,6 +165,12 @@ def upgrade() -> None:
         table_args.append(sa.ForeignKeyConstraint(['chat_id'], ['chat.id'], ondelete='CASCADE'))
     op.create_table('chat_message', *table_args)
 
+    op.create_table(
+        CURRENT_MESSAGE_HINT_TABLE,
+        sa.Column('chat_id', sa.Text(), primary_key=True),
+        sa.Column('message_id', sa.Text(), nullable=False),
+    )
+
     # Step 2: Backfill from existing chats
     chat_table = sa.table(
         'chat',
@@ -113,19 +186,27 @@ def upgrade() -> None:
         sa.column('user_id', sa.Text()),
         sa.column('role', sa.Text()),
         sa.column('parent_id', sa.Text()),
-        sa.column('content', sa.JSON()),
-        sa.column('output', sa.JSON()),
+        sa.column('content', _JSON()),
+        sa.column('output', _JSON()),
         sa.column('model_id', sa.Text()),
-        sa.column('files', sa.JSON()),
-        sa.column('sources', sa.JSON()),
-        sa.column('embeds', sa.JSON()),
+        sa.column('files', _JSON()),
+        sa.column('sources', _JSON()),
+        sa.column('embeds', _JSON()),
         sa.column('done', sa.Boolean()),
-        sa.column('status_history', sa.JSON()),
-        sa.column('error', sa.JSON()),
-        sa.column('usage', sa.JSON()),
+        sa.column('status_history', _JSON()),
+        sa.column('error', _JSON()),
+        sa.column('usage', _JSON()),
         sa.column('created_at', sa.BigInteger()),
         sa.column('updated_at', sa.BigInteger()),
     )
+
+    hint_table = sa.table(
+        CURRENT_MESSAGE_HINT_TABLE,
+        sa.column('chat_id', sa.Text()),
+        sa.column('message_id', sa.Text()),
+    )
+    hints_batch = []
+    uncertain_chats = set()
 
     # Stream rows instead of loading all into memory:
     # - yield_per: fetches rows in chunks via cursor.fetchmany() (all backends)
@@ -164,6 +245,8 @@ def upgrade() -> None:
         if not isinstance(messages, dict):
             continue
 
+        backfilled_ids = set()
+
         for message_id, message in messages.items():
             if not isinstance(message, dict):
                 continue
@@ -186,6 +269,7 @@ def upgrade() -> None:
             if timestamp < 1577836800 or timestamp > now + 86400:
                 timestamp = now
 
+            backfilled_ids.add(message_id)
             messages_batch.append(
                 {
                     'id': f'{chat_id}-{message_id}',
@@ -210,22 +294,68 @@ def upgrade() -> None:
 
             # Flush batch when full
             if len(messages_batch) >= BATCH_SIZE:
-                inserted, failed = _flush_batch(conn, chat_message_table, messages_batch)
+                inserted, failed = _flush_batch(conn, chat_message_table, messages_batch, uncertain_chats)
                 total_inserted += inserted
                 total_failed += failed
                 if total_inserted % 50000 < BATCH_SIZE:
                     log.info(f'Migration progress: {total_inserted} messages inserted...')
                 messages_batch.clear()
 
+        # Record the chat's current message for revision 9a1b2c3d4e5f: the first
+        # of its candidates (in that revision's order) that is one of the
+        # messages just backfilled. Chats without such a candidate get no hint
+        # and are resolved by that revision's own fallback rules.
+        prefix = f'{chat_id}-'
+        for candidate in (
+            _hint_candidate(history.get('currentId'), prefix),
+            _hint_candidate(chat_data.get('currentId'), prefix),
+            _hint_candidate(chat_data.get('branchPointMessageId'), prefix),
+        ):
+            if candidate is not None and candidate in backfilled_ids:
+                hints_batch.append({'chat_id': chat_id, 'message_id': candidate})
+                break
+        if len(hints_batch) >= BATCH_SIZE:
+            conn.execute(sa.insert(hint_table), hints_batch)
+            hints_batch.clear()
+
     # Flush remaining messages
     if messages_batch:
-        inserted, failed = _flush_batch(conn, chat_message_table, messages_batch)
+        inserted, failed = _flush_batch(conn, chat_message_table, messages_batch, uncertain_chats)
         total_inserted += inserted
         total_failed += failed
 
-    log.info(f'Backfilled {total_inserted} messages into chat_message table ({total_failed} failed)')
+    if hints_batch:
+        conn.execute(sa.insert(hint_table), hints_batch)
 
     # Step 3: Build the indexes and the foreign key once, over the loaded data
+    if is_postgresql:
+        # Without duplicated ids - the normal case - this is a single sorted
+        # index build. Only if it fails are the duplicates looked for.
+        savepoint = conn.begin_nested()
+        try:
+            op.create_primary_key('chat_message_pkey', 'chat_message', ['id'])
+            savepoint.commit()
+        except Exception:
+            savepoint.rollback()
+            removed = conn.execute(sa.text(_PG_REMOVE_DUPLICATES_SQL)).fetchall()
+            for row in removed:
+                uncertain_chats.add(row[0])
+                log.warning(f'Removed a duplicated message id of chat {row[0]}')
+            total_inserted -= len(removed)
+            total_failed += len(removed)
+            op.create_primary_key('chat_message_pkey', 'chat_message', ['id'])
+
+    log.info(f'Backfilled {total_inserted} messages into chat_message table ({total_failed} failed)')
+
+    # A hint is only trustworthy if every message of its chat made it into
+    # chat_message. Drop the hints of the chats where that is not certain.
+    if len(uncertain_chats) > MAX_UNCERTAIN_CHATS:
+        conn.execute(sa.delete(hint_table))
+    elif uncertain_chats:
+        uncertain = sorted(uncertain_chats)
+        for start in range(0, len(uncertain), BATCH_SIZE):
+            conn.execute(sa.delete(hint_table).where(hint_table.c.chat_id.in_(uncertain[start : start + BATCH_SIZE])))
+
     op.create_index('ix_chat_message_chat_id', 'chat_message', ['chat_id'])
     op.create_index('ix_chat_message_user_id', 'chat_message', ['user_id'])
     op.create_index('ix_chat_message_model_id', 'chat_message', ['model_id'])
@@ -246,6 +376,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(f'DROP TABLE IF EXISTS {CURRENT_MESSAGE_HINT_TABLE}')
     op.drop_index('chat_message_user_created_idx', table_name='chat_message')
     op.drop_index('chat_message_model_created_idx', table_name='chat_message')
     op.drop_index('chat_message_chat_parent_idx', table_name='chat_message')

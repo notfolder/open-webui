@@ -19,12 +19,27 @@ depends_on: Union[str, Sequence[str], None] = None
 
 BATCH_SIZE = 150
 
+# Written by revision 8452d01d26d7 (see CURRENT_MESSAGE_HINT_TABLE there)
+HINT_TABLE = 'migration_chat_current_message_hint'
+
+# Each hint is the message the loop's first rule would pick for that chat: the
+# first candidate (history.currentId, chat.currentId, chat.branchPointMessageId)
+# that exists in chat_message. Revision 8452d01d26d7 only writes a hint when it
+# is certain of that.
+_RESOLVE_FROM_HINTS_SQL = f"""
+UPDATE chat
+SET current_message_id = h.message_id
+FROM {HINT_TABLE} h
+WHERE chat.id = h.chat_id
+"""
+
 
 def upgrade() -> None:
     conn = op.get_bind()
     inspector = sa.inspect(conn)
     columns = [col['name'] for col in inspector.get_columns('chat')]
-    if 'current_message_id' not in columns:
+    column_is_new = 'current_message_id' not in columns
+    if column_is_new:
         op.add_column('chat', sa.Column('current_message_id', sa.Text(), nullable=True))
 
     chat = sa.table(
@@ -41,9 +56,32 @@ def upgrade() -> None:
         sa.column('created_at', sa.BigInteger()),
     )
 
-    has_chat_message = 'chat_message' in inspector.get_table_names()
+    table_names = inspector.get_table_names()
+    has_chat_message = 'chat_message' in table_names
+    has_hints = HINT_TABLE in table_names
+
+    # Fast path: revision 8452d01d26d7 recorded each chat's current message
+    # while it backfilled chat_message. Apply those in one statement - they
+    # cover the first rule of the loop below, the one that applies to nearly
+    # all chats. The loop then only reads the documents of the chats still
+    # unresolved.
+    #
+    # This matches the loop only when the column was just added: the loop gives
+    # an existing current_message_id the highest priority, and a new column has
+    # none.
+    only_unresolved = False
+    if has_hints and has_chat_message and column_is_new:
+        conn.execute(sa.text(_RESOLVE_FROM_HINTS_SQL))
+        only_unresolved = True
+    if has_hints:
+        op.drop_table(HINT_TABLE)
+
+    query = sa.select(chat.c.id, chat.c.chat, chat.c.current_message_id)
+    if only_unresolved:
+        query = query.where(chat.c.current_message_id.is_(None))
+
     result = conn.execute(
-        sa.select(chat.c.id, chat.c.chat, chat.c.current_message_id).execution_options(
+        query.execution_options(
             yield_per=BATCH_SIZE,
             stream_results=True,
         )
