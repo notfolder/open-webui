@@ -7,6 +7,8 @@ for f in glob.glob(f'results/{src}-*.json'):
     if r['label'].startswith('verify'):
         continue
     m = {x['revision'][:4]: x for x in r['migrations']}
+    if '8452' not in m:
+        continue
     rows.append((os.path.getmtime(f), r['label'], r['total_seconds'], m['8452']['seconds'], m['8452'].get('wal_mb', 0),
                  m['9a1b']['seconds'], m['c1d2']['seconds'], sum(x.get('wal_mb', 0) for x in r['migrations'])))
 print(f"{'label':12s} {'total':>7s} {'8452':>7s} {'8452WAL':>8s} {'9a1b':>7s} {'c1d2':>6s} {'WAL計':>7s}")

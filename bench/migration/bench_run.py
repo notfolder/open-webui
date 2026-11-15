@@ -38,6 +38,8 @@ def main():
     ap.add_argument('--source', required=True)
     ap.add_argument('--label', default='baseline')
     ap.add_argument('--to', default='head')
+    ap.add_argument('--single-transaction', action='store_true',
+                    help='本番と同じく、全マイグレーションを 1 つのトランザクションで実行する（1 本ごとの時間は、開始のログの時刻の差で出す）')
     a = ap.parse_args()
 
     run_db = f'{a.source}_run'
@@ -79,6 +81,42 @@ def main():
     total = 0.0
     def wal_lsn():
         return admin('SELECT pg_current_wal_lsn() - \'0/0\'::pg_lsn', db=run_db, fetch=True)[0][0]
+
+    if a.single_transaction:
+        # Alembic は 1 本ごとに「Running upgrade A -> B」をログに出す。その時刻を拾って、1 本ごとの時間にする
+        import alembic.runtime.migration as _m
+
+        starts = []
+        _orig_info = _m.log.info
+
+        def _info(msg, *args, **kwargs):
+            # env.py がログの設定を入れ直しても拾えるよう、ハンドラではなく呼び出しそのものを包む
+            text = str(msg) % args if args else str(msg)
+            if text.startswith('Running upgrade'):
+                starts.append((time.time(), text.split('->')[1].split(',')[0].strip()))
+            return _orig_info(msg, *args, **kwargs)
+
+        _m.log.info = _info
+        wal0 = wal_lsn()
+        t_begin = time.time()
+        try:
+            command.upgrade(cfg, a.to)
+        finally:
+            _m.log.info = _orig_info
+        t_end = time.time()
+        names = {r.revision: Path(r.path).stem for r in revisions}
+        for i, (t, revision) in enumerate(starts):
+            nxt = starts[i + 1][0] if i + 1 < len(starts) else t_end
+            dt = nxt - t
+            name = names.get(revision, revision)
+            result['migrations'].append({'revision': revision, 'name': name, 'seconds': round(dt, 2), 'wal_mb': 0.0})
+            if dt > 5:
+                print(f'{dt:9.2f}s  {name}', flush=True)
+        total = t_end - t_begin
+        result['single_transaction'] = True
+        result['wal_mb_total'] = round(float(wal_lsn() - wal0) / 1048576, 1)
+        print(f'（最後の時間には、全体の確定にかかった時間を含む）WAL 合計 {result["wal_mb_total"]:.0f} MB', flush=True)
+        revisions = []
 
     for rev in revisions:
         wal0 = wal_lsn()
