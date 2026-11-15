@@ -16,6 +16,14 @@ from alembic import op
 
 log = logging.getLogger(__name__)
 
+# Progress is reported through Alembic's own logger: alembic.ini only lets
+# INFO messages through for the "alembic" loggers, so they appear next to the
+# "Running upgrade ..." lines.
+progress_log = logging.getLogger('alembic.runtime.migration')
+
+# Seconds between two progress lines during the backfill
+PROGRESS_INTERVAL = 30
+
 revision: str = '8452d01d26d7'
 down_revision: Union[str, None] = '374d2f66af06'
 branch_labels: Union[str, Sequence[str], None] = None
@@ -75,6 +83,26 @@ class _JSON(sa.types.TypeDecorator):
 
     def bind_processor(self, dialect):
         return _dumps
+
+
+def _duration(seconds):
+    """Seconds as a short human-readable duration, e.g. 1h05m or 3m20s."""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f'{seconds // 3600}h{seconds % 3600 // 60:02d}m'
+    if seconds >= 60:
+        return f'{seconds // 60}m{seconds % 60:02d}s'
+    return f'{seconds}s'
+
+
+def _timed_step(position, total, label, action):
+    """Run one of the steps that follow the backfill and report how long it took."""
+    started = time.monotonic()
+    progress_log.info(f'chat_message: step {position} of {total}: {label} ...')
+    action()
+    progress_log.info(
+        f'chat_message: step {position} of {total}: {label} done in {_duration(time.monotonic() - started)}'
+    )
 
 
 def _hint_candidate(value, prefix):
@@ -208,6 +236,16 @@ def upgrade() -> None:
     hints_batch = []
     uncertain_chats = set()
 
+    # Number of chats to go through, for the progress lines. This reads the
+    # chat rows without their documents, so it is quick even on a large table.
+    total_chats = conn.execute(
+        sa.select(sa.func.count()).select_from(chat_table).where(~chat_table.c.user_id.like('shared-%'))
+    ).scalar()
+    progress_log.info(
+        f'chat_message backfill: {total_chats:,} chats to go through; '
+        f'progress is reported every {PROGRESS_INTERVAL} seconds'
+    )
+
     # Stream rows instead of loading all into memory:
     # - yield_per: fetches rows in chunks via cursor.fetchmany() (all backends)
     # - stream_results: enables server-side cursors on PostgreSQL (no-op on SQLite)
@@ -221,8 +259,26 @@ def upgrade() -> None:
     messages_batch = []
     total_inserted = 0
     total_failed = 0
+    chats_done = 0
+    backfill_started = time.monotonic()
+    last_progress = backfill_started
 
     for chat_row in result:
+        chats_done += 1
+        if chats_done % 100 == 0:
+            moment = time.monotonic()
+            if moment - last_progress >= PROGRESS_INTERVAL:
+                last_progress = moment
+                elapsed = moment - backfill_started
+                remaining = elapsed * (total_chats - chats_done) / chats_done if total_chats > chats_done else 0
+                progress_log.info(
+                    f'chat_message backfill: {chats_done:,} of {total_chats:,} chats '
+                    f'({100 * chats_done / max(total_chats, 1):.1f}%), '
+                    f'{total_inserted + len(messages_batch):,} messages, '
+                    f'{_duration(elapsed)} elapsed, about {_duration(remaining)} left for the backfill '
+                    f'(the indexes are built after it)'
+                )
+
         chat_id = chat_row[0]
         user_id = chat_row[1]
         chat_data = chat_row[2]
@@ -297,8 +353,6 @@ def upgrade() -> None:
                 inserted, failed = _flush_batch(conn, chat_message_table, messages_batch, uncertain_chats)
                 total_inserted += inserted
                 total_failed += failed
-                if total_inserted % 50000 < BATCH_SIZE:
-                    log.info(f'Migration progress: {total_inserted} messages inserted...')
                 messages_batch.clear()
 
         # Record the chat's current message for revision 9a1b2c3d4e5f: the first
@@ -327,8 +381,17 @@ def upgrade() -> None:
     if hints_batch:
         conn.execute(sa.insert(hint_table), hints_batch)
 
+    backfill_seconds = time.monotonic() - backfill_started
+    progress_log.info(
+        f'chat_message backfill: finished {chats_done:,} chats, {total_inserted:,} messages '
+        f'in {_duration(backfill_seconds)}; building the indexes next'
+    )
+    steps_total = 9 if is_postgresql else 7
+
     # Step 3: Build the indexes and the foreign key once, over the loaded data
     if is_postgresql:
+        key_started = time.monotonic()
+        progress_log.info(f'chat_message: step 1 of {steps_total}: primary key ...')
         # Without duplicated ids - the normal case - this is a single sorted
         # index build. Only if it fails are the duplicates looked for.
         savepoint = conn.begin_nested()
@@ -344,6 +407,9 @@ def upgrade() -> None:
             total_inserted -= len(removed)
             total_failed += len(removed)
             op.create_primary_key('chat_message_pkey', 'chat_message', ['id'])
+        progress_log.info(
+            f'chat_message: step 1 of {steps_total}: primary key done in {_duration(time.monotonic() - key_started)}'
+        )
 
     log.info(f'Backfilled {total_inserted} messages into chat_message table ({total_failed} failed)')
 
@@ -356,23 +422,44 @@ def upgrade() -> None:
         for start in range(0, len(uncertain), BATCH_SIZE):
             conn.execute(sa.delete(hint_table).where(hint_table.c.chat_id.in_(uncertain[start : start + BATCH_SIZE])))
 
-    op.create_index('ix_chat_message_chat_id', 'chat_message', ['chat_id'])
-    op.create_index('ix_chat_message_user_id', 'chat_message', ['user_id'])
-    op.create_index('ix_chat_message_model_id', 'chat_message', ['model_id'])
-    op.create_index('ix_chat_message_created_at', 'chat_message', ['created_at'])
-    op.create_index('chat_message_chat_parent_idx', 'chat_message', ['chat_id', 'parent_id'])
-    op.create_index('chat_message_model_created_idx', 'chat_message', ['model_id', 'created_at'])
-    op.create_index('chat_message_user_created_idx', 'chat_message', ['user_id', 'created_at'])
+    indexes = [
+        ('ix_chat_message_chat_id', ['chat_id']),
+        ('ix_chat_message_user_id', ['user_id']),
+        ('ix_chat_message_model_id', ['model_id']),
+        ('ix_chat_message_created_at', ['created_at']),
+        ('chat_message_chat_parent_idx', ['chat_id', 'parent_id']),
+        ('chat_message_model_created_idx', ['model_id', 'created_at']),
+        ('chat_message_user_created_idx', ['user_id', 'created_at']),
+    ]
+    position = steps_total - len(indexes) - (0 if is_sqlite else 1)
+    for name, columns in indexes:
+        position += 1
+        _timed_step(
+            position,
+            steps_total,
+            f'index {name}',
+            lambda name=name, columns=columns: op.create_index(name, 'chat_message', columns),
+        )
 
     if not is_sqlite:
-        op.create_foreign_key(
-            'chat_message_chat_id_fkey',
-            'chat_message',
-            'chat',
-            ['chat_id'],
-            ['id'],
-            ondelete='CASCADE',
+        _timed_step(
+            steps_total,
+            steps_total,
+            'foreign key to chat',
+            lambda: op.create_foreign_key(
+                'chat_message_chat_id_fkey',
+                'chat_message',
+                'chat',
+                ['chat_id'],
+                ['id'],
+                ondelete='CASCADE',
+            ),
         )
+
+    progress_log.info(
+        f'chat_message: all done in {_duration(time.monotonic() - backfill_started)} '
+        f'(backfill {_duration(backfill_seconds)})'
+    )
 
 
 def downgrade() -> None:
