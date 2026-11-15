@@ -9,3 +9,4 @@ test-account.env
 .verify_backup/
 .matrix_backup.py
 .env
+.matrix_backup/

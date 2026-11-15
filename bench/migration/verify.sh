@@ -24,6 +24,12 @@ run "verify-new"
 P -c "DROP DATABASE IF EXISTS ${SRC}_vnew WITH (FORCE)" -c "ALTER DATABASE ${SRC}_run RENAME TO ${SRC}_vnew" >/dev/null
 
 "$HERE/venvnew/bin/python" "$HERE/compare_dbs.py" "${SRC}_vref" "${SRC}_vnew" chat_message id
+"$HERE/venvnew/bin/python" "$HERE/compare_dbs.py" "${SRC}_vref" "${SRC}_vnew" chat id user_id,title,share_id,archived,pinned
+if P -d "${SRC}_vnew" -c "select 1 from information_schema.tables where table_name='shared_chat'" | grep -q 1; then
+  "$HERE/venvnew/bin/python" "$HERE/compare_dbs.py" "${SRC}_vref" "${SRC}_vnew" shared_chat id
+  # access_grant の id は実行ごとに違う乱数なので、付けた相手（resource_id）で突き合わせる
+  "$HERE/venvnew/bin/python" "$HERE/compare_dbs.py" "${SRC}_vref" "${SRC}_vnew" access_grant resource_id resource_type,principal_type,principal_id,permission,created_at
+fi
 if P -d "${SRC}_vnew" -c "select 1 from information_schema.columns where table_name='chat' and column_name='current_message_id'" | grep -q 1; then
   "$HERE/venvnew/bin/python" "$HERE/compare_dbs.py" "${SRC}_vref" "${SRC}_vnew" chat id current_message_id
 fi

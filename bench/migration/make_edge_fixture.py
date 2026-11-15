@@ -93,6 +93,10 @@ rows = [
     ('a', 'user-1', chat_doc({'b-c': msg('b-c')}, 'b-c')),
     # 共有されたチャット（0.7.2 の形式）は対象外
     ('share-token-1', 'shared-edge-main', chat_doc({'s1': msg('s1')}, 's1')),
+    # 共有のいろいろな形（c1d2 の確認用）: 同じチャットの 2 つ目の共有、元のチャットが無い共有、ほかのチャットの共有
+    ('share-token-2', 'shared-edge-main', chat_doc({'s2': msg('s2')}, 's2')),
+    ('share-orphan', 'shared-no-such-chat', chat_doc({'s3': msg('s3')}, 's3')),
+    ('share-token-3', 'shared-a', chat_doc({'s4': msg('s4', content='日本語の共有')}, 's4')),
     # currentId のいろいろな形（9a1b の確認用）
     ('cur-prefixed', 'user-1', chat_doc({'m1': msg('m1'), 'm2': msg('m2', parentId='m1', timestamp=T + 5)}, 'cur-prefixed-m2')),
     ('cur-missing-id', 'user-1', chat_doc({'m1': msg('m1'), 'm2': msg('m2', parentId='m1', timestamp=T + 5)}, 'nope')),
