@@ -6,6 +6,7 @@ Create Date: 2026-04-16 23:00:00.000000
 
 """
 
+import logging
 import time
 import uuid
 
@@ -16,6 +17,8 @@ revision = 'c1d2e3f4a5b6'
 down_revision = 'e1f2a3b4c5d6'
 branch_labels = None
 depends_on = None
+
+log = logging.getLogger(__name__)
 
 # Lightweight table references for data migration (no ORM models needed)
 chat_t = sa.table(
@@ -59,6 +62,85 @@ access_grant_t = sa.table(
 )
 
 
+# PostgreSQL: move the shares with two statements instead of reading every
+# shared chat document into memory and issuing several statements per share.
+# The rules are those of the loop in upgrade(): a share is migrated only if its
+# original chat still exists, an existing shared_chat row is left alone, and
+# each original chat gets one user:*:read grant unless it already has one.
+_PG_INSERT_SHARED_CHATS_SQL = """
+INSERT INTO shared_chat (id, chat_id, user_id, title, chat, created_at, updated_at)
+SELECT s.id, o.id, o.user_id, s.title, s.chat, s.created_at, s.updated_at
+FROM chat s
+JOIN chat o ON o.id = substr(s.user_id, 8)
+WHERE s.user_id LIKE 'shared-%'
+    AND NOT EXISTS (SELECT 1 FROM shared_chat x WHERE x.id = s.id)
+"""
+
+_PG_INSERT_GRANTS_SQL = """
+INSERT INTO access_grant (id, resource_type, resource_id, principal_type, principal_id, permission, created_at)
+SELECT
+    gen_random_uuid()::text, 'shared_chat', t.chat_id, 'user', '*', 'read',
+    COALESCE(NULLIF(t.created_at, 0), :now)
+FROM (
+    SELECT DISTINCT ON (o.id) o.id AS chat_id, s.created_at
+    FROM chat s
+    JOIN chat o ON o.id = substr(s.user_id, 8)
+    WHERE s.user_id LIKE 'shared-%'
+    ORDER BY o.id, s.id
+) t
+WHERE NOT EXISTS (
+    SELECT 1 FROM access_grant g
+    WHERE g.resource_type = 'shared_chat'
+        AND g.resource_id = t.chat_id
+        AND g.principal_type = 'user'
+        AND g.principal_id = '*'
+        AND g.permission = 'read'
+)
+"""
+
+
+def _migrate_shares_postgresql(conn):
+    """Return True if the shares were migrated; False to let the loop do it."""
+    savepoint = conn.begin_nested()
+    try:
+        conn.execute(sa.text(_PG_INSERT_SHARED_CHATS_SQL))
+        conn.execute(sa.text(_PG_INSERT_GRANTS_SQL), {'now': int(time.time())})
+        savepoint.commit()
+        return True
+    except Exception as e:
+        savepoint.rollback()
+        log.warning(f'In-database share migration failed, migrating share by share: {e}')
+        return False
+
+
+def _chat_message_cascades(conn, inspector):
+    """Whether deleting a chat is certain to delete its chat_message rows."""
+    if conn.dialect.name != 'postgresql':
+        # SQLite only enforces foreign keys when asked to
+        return False
+    for fk in inspector.get_foreign_keys('chat_message'):
+        if (
+            fk.get('referred_table') == 'chat'
+            and fk.get('constrained_columns') == ['chat_id']
+            and str((fk.get('options') or {}).get('ondelete', '')).upper() == 'CASCADE'
+        ):
+            return True
+    return False
+
+
+def _fetch_shared_rows(conn):
+    return conn.execute(
+        sa.select(
+            chat_t.c.id,
+            chat_t.c.user_id,
+            chat_t.c.title,
+            chat_t.c.chat,
+            chat_t.c.created_at,
+            chat_t.c.updated_at,
+        ).where(chat_t.c.user_id.like('shared-%'))
+    ).fetchall()
+
+
 def upgrade():
     conn = op.get_bind()
     inspector = sa.inspect(conn)
@@ -78,16 +160,10 @@ def upgrade():
         )
 
     # 2. Migrate existing shared-* rows
-    shared_rows = conn.execute(
-        sa.select(
-            chat_t.c.id,
-            chat_t.c.user_id,
-            chat_t.c.title,
-            chat_t.c.chat,
-            chat_t.c.created_at,
-            chat_t.c.updated_at,
-        ).where(chat_t.c.user_id.like('shared-%'))
-    ).fetchall()
+    if conn.dialect.name == 'postgresql' and _migrate_shares_postgresql(conn):
+        shared_rows = []
+    else:
+        shared_rows = _fetch_shared_rows(conn)
 
     for row in shared_rows:
         share_token = row.id
@@ -146,11 +222,18 @@ def upgrade():
             )
 
     # 3. Clean up old phantom rows
-    conn.execute(
-        chat_message_t.delete().where(
-            chat_message_t.c.chat_id.in_(sa.select(chat_t.c.id).where(chat_t.c.user_id.like('shared-%')))
+    #
+    # Deleting the shared-* chats below also deletes their messages when
+    # chat_message has its ON DELETE CASCADE foreign key to chat. In that case
+    # the explicit delete is skipped: it finds its rows by reading all of
+    # chat_message, which on a large table takes minutes to remove what the
+    # cascade removes anyway.
+    if not _chat_message_cascades(conn, inspector):
+        conn.execute(
+            chat_message_t.delete().where(
+                chat_message_t.c.chat_id.in_(sa.select(chat_t.c.id).where(chat_t.c.user_id.like('shared-%')))
+            )
         )
-    )
     conn.execute(chat_t.delete().where(chat_t.c.user_id.like('shared-%')))
 
 
