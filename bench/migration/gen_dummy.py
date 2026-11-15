@@ -144,7 +144,7 @@ def make_chat(rng: random.Random, base_ts: int):
                 'modelName': model,
                 'modelIdx': 0,
                 'timestamp': ts,
-                'lastSentence': content[-rng.randint(60, 200):].replace('\n', ' '),
+                'lastSentence': content[-rng.randint(60, 200) :].replace('\n', ' '),
                 'usage': {
                     'prompt_tokens': rng.randint(50, 4000),
                     'completion_tokens': rng.randint(50, 1500),
@@ -216,10 +216,34 @@ def worker(args):
             archived = 't' if rng.random() < 0.02 else 'f'
             pinned = 't' if rng.random() < 0.01 else 'f'
             meta = json.dumps({'tags': rng.sample(TAGS, rng.randint(1, 3))}) if rng.random() < 0.8 else '{}'
-            row = [chat_id, user_id, copy_escape(title), share_id or '\\N', archived, created, updated, body, pinned, meta, '\\N']
+            row = [
+                chat_id,
+                user_id,
+                copy_escape(title),
+                share_id or '\\N',
+                archived,
+                created,
+                updated,
+                body,
+                pinned,
+                meta,
+                '\\N',
+            ]
             buf.write('\t'.join(map(str, row)) + '\n')
             if share_id:
-                row = [share_id, f'shared-{chat_id}', copy_escape(title), '\\N', 'f', created, updated, body, 'f', meta, '\\N']
+                row = [
+                    share_id,
+                    f'shared-{chat_id}',
+                    copy_escape(title),
+                    '\\N',
+                    'f',
+                    created,
+                    updated,
+                    body,
+                    'f',
+                    meta,
+                    '\\N',
+                ]
                 buf.write('\t'.join(map(str, row)) + '\n')
             done += 1
         buf.seek(0)
@@ -237,7 +261,9 @@ def main():
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--chunk', type=int, default=200)
-    ap.add_argument('--text', choices=['natural', 'pool'], default='natural', help='本文の作り方（上の TEXT_MODE の説明を参照）')
+    ap.add_argument(
+        '--text', choices=['natural', 'pool'], default='natural', help='本文の作り方（上の TEXT_MODE の説明を参照）'
+    )
     ap.add_argument('--ja-ratio', type=float, default=0.6, help='natural のとき、日本語から切り出す割合')
     a = ap.parse_args()
     global TEXT_MODE, JA_RATIO
@@ -259,7 +285,8 @@ def main():
     buf_u.seek(0)
     buf_a.seek(0)
     cur.copy_expert(
-        'COPY "user" (id, name, email, role, profile_image_url, created_at, updated_at, last_active_at) FROM STDIN', buf_u
+        'COPY "user" (id, name, email, role, profile_image_url, created_at, updated_at, last_active_at) FROM STDIN',
+        buf_u,
     )
     cur.copy_expert('COPY auth (id, email, password, active) FROM STDIN', buf_a)
     conn.commit()

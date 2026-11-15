@@ -38,8 +38,11 @@ def main():
     ap.add_argument('--source', required=True)
     ap.add_argument('--label', default='baseline')
     ap.add_argument('--to', default='head')
-    ap.add_argument('--single-transaction', action='store_true',
-                    help='本番と同じく、全マイグレーションを 1 つのトランザクションで実行する（1 本ごとの時間は、開始のログの時刻の差で出す）')
+    ap.add_argument(
+        '--single-transaction',
+        action='store_true',
+        help='本番と同じく、全マイグレーションを 1 つのトランザクションで実行する（1 本ごとの時間は、開始のログの時刻の差で出す）',
+    )
     a = ap.parse_args()
 
     run_db = f'{a.source}_run'
@@ -79,8 +82,9 @@ def main():
     }
 
     total = 0.0
+
     def wal_lsn():
-        return admin('SELECT pg_current_wal_lsn() - \'0/0\'::pg_lsn', db=run_db, fetch=True)[0][0]
+        return admin("SELECT pg_current_wal_lsn() - '0/0'::pg_lsn", db=run_db, fetch=True)[0][0]
 
     if a.single_transaction:
         # Alembic は 1 本ごとに「Running upgrade A -> B」をログに出す。その時刻を拾って、1 本ごとの時間にする
@@ -126,7 +130,9 @@ def main():
         wal_mb = float(wal_lsn() - wal0) / 1048576
         total += dt
         name = Path(rev.path).stem
-        result['migrations'].append({'revision': rev.revision, 'name': name, 'seconds': round(dt, 2), 'wal_mb': round(wal_mb, 1)})
+        result['migrations'].append(
+            {'revision': rev.revision, 'name': name, 'seconds': round(dt, 2), 'wal_mb': round(wal_mb, 1)}
+        )
         print(f'{dt:9.2f}s  WAL {wal_mb:9.1f} MB  {name}', flush=True)
 
     result['total_seconds'] = round(total, 1)

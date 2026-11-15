@@ -3,6 +3,7 @@
 - JSON の列は文字列としての一致と、意味としての一致（jsonb）を分けて数える
 - created_at / updated_at が「マイグレーションを実行した時刻」で埋まった行は、実行ごとに値が違うので同じとみなす
 """
+
 import sys
 
 import json
@@ -22,6 +23,7 @@ class _Iter:
     def fetchone(self):
         return next(self.it, None)
 
+
 a_db, b_db, table, pk = sys.argv[1:5]
 BASE = 'postgresql://postgres:bench@127.0.0.1:55432'
 RUN_T0 = 1790000000  # これ以降の時刻は「実行時刻で埋めた値」とみなす（ダミーデータの時刻はこれより前）
@@ -30,7 +32,10 @@ RUN_T0 = 1790000000  # これ以降の時刻は「実行時刻で埋めた値」
 def rows(db):
     conn = psycopg2.connect(f'{BASE}/{db}')
     cur = conn.cursor()
-    cur.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name=%s ORDER BY ordinal_position", (table,))
+    cur.execute(
+        'SELECT column_name, data_type FROM information_schema.columns WHERE table_name=%s ORDER BY ordinal_position',
+        (table,),
+    )
     cols = cur.fetchall()
     if len(sys.argv) > 5:
         want = sys.argv[5].split(',')
@@ -69,19 +74,29 @@ ca, ra, cols = rows(a_db)
 cb, rb, _ = rows(b_db)
 only_a = only_b = diff = same = 0
 examples = []
-x = ra.fetchone(); y = rb.fetchone()
+x = ra.fetchone()
+y = rb.fetchone()
 while x or y:
     if y is None or (x is not None and x[0] < y[0]):
-        only_a += 1; examples.append(('基準だけ', x[0])); x = ra.fetchone()
+        only_a += 1
+        examples.append(('基準だけ', x[0]))
+        x = ra.fetchone()
     elif x is None or y[0] < x[0]:
-        only_b += 1; examples.append(('比較だけ', y[0])); y = rb.fetchone()
+        only_b += 1
+        examples.append(('比較だけ', y[0]))
+        y = rb.fetchone()
     else:
         if x[1] == y[1]:
             same += 1
         else:
-            diff += 1; examples.append(('内容が違う', x[0]))
-        x = ra.fetchone(); y = rb.fetchone()
-print(('[意味で比較] ' if SEMANTIC else '[文字列で比較] ') + f'{table}: 一致 {same} / 内容が違う {diff} / 基準だけ {only_a} / 比較だけ {only_b}')
+            diff += 1
+            examples.append(('内容が違う', x[0]))
+        x = ra.fetchone()
+        y = rb.fetchone()
+print(
+    ('[意味で比較] ' if SEMANTIC else '[文字列で比較] ')
+    + f'{table}: 一致 {same} / 内容が違う {diff} / 基準だけ {only_a} / 比較だけ {only_b}'
+)
 for kind, key in examples[:15]:
     print('  ', kind, key)
 sys.exit(0 if not (diff or only_a or only_b) else 1)
