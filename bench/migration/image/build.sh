@@ -3,6 +3,8 @@
 # 使い方: bench/migration/image/build.sh [タグ] [プラットフォーム]
 #   例: bench/migration/image/build.sh owui-migrate:0.13.3 linux/amd64
 # 元にするイメージを変えるとき: BASE_IMAGE=<イメージ> bench/migration/image/build.sh ...
+#   例（v0.12.3 用）: BASE_IMAGE=ghcr.io/open-webui/open-webui:v0.12.3 bench/migration/image/build.sh owui-migrate:0.12.3 linux/amd64
+#   移行先の版と最終位置は、道具がイメージの中身から読むので、ほかに変える所は無い。
 # プラットフォームを省くと、このマシンと同じものになる。本番が x86 のサーバーなら linux/amd64 を指定する。
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$HERE/../../.."

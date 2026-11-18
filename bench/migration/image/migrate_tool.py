@@ -1,4 +1,4 @@
-"""0.7.2 から v0.13.3 へのマイグレーションを、アプリを起動せずに実行するための道具。
+"""0.7.2 から、元にしたイメージの版（v0.12.3、v0.13.3 など）へのマイグレーションを、アプリを起動せずに実行するための道具。
 
 マイグレーション専用イメージの入口。接続先は、アプリと同じ環境変数 DATABASE_URL で渡す。
 
@@ -7,13 +7,17 @@
     monitor [--every 秒]  実行中に、別の端末から進み具合を見る（読むだけ）
     check                 終わったあとの確認（読むだけ）
 
+移行先の版と、マイグレーションの最終位置は、イメージの中身から読む（版ごとに書き換えない）。
+
 時間の式は、Mac mini（外付け SSD）での実測から作った。本番の時間は「式の値 × 速さの比 F」。
 F は、検証環境で run を動かし、実際の時間 ÷ 式の値 で求める。
 """
 
 import argparse
+import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,9 +25,45 @@ import time
 import psycopg2
 
 START_REVISION = 'c440947495f3'  # 0.7.2
-HEAD_REVISION = '9f6c2a8d1b43'  # v0.13.3
 BACKEND_DIR = os.environ.get('OPEN_WEBUI_BACKEND_DIR', '/app/backend')
 GB = 1024**3
+
+_target = None
+
+
+def target():
+    """移行先（イメージに入っているマイグレーションの最終位置、アプリの版）を返す。"""
+    global _target
+    if _target is None:
+        # ファイルを読み込む（import する）とアプリの設定まで読まれるので、文字として読む
+        versions = os.path.join(BACKEND_DIR, 'open_webui', 'migrations', 'versions')
+        revisions, parents = set(), set()
+        for name in os.listdir(versions):
+            if not name.endswith('.py'):
+                continue
+            with open(os.path.join(versions, name)) as f:
+                text = f.read()
+            found = re.search(r'^revision\b[^=\n]*=\s*[\'"]([^\'"]+)', text, re.M)
+            if not found:
+                continue
+            revisions.add(found.group(1))
+            down = re.search(r'^down_revision\b[^=\n]*=\s*(.+)$', text, re.M)
+            if down:
+                parents.update(re.findall(r'[\'"]([^\'"]+)[\'"]', down.group(1)))
+        heads = sorted(revisions - parents)
+        if len(heads) != 1:
+            sys.exit(f'マイグレーションの最終位置を 1 つに決められません: {heads}')
+        head = heads[0]
+        version = '版は不明'
+        for path in (os.path.join(BACKEND_DIR, '..', 'package.json'), os.path.join(BACKEND_DIR, 'package.json')):
+            try:
+                with open(path) as f:
+                    version = 'v' + json.load(f)['version']
+                break
+            except (OSError, ValueError, KeyError):
+                continue
+        _target = (head, version)
+    return _target
 
 
 def connect():
@@ -153,6 +193,8 @@ def cmd_estimate(args):
         if info['revision'] == START_REVISION
         else '（0.7.2 ではありません。式は 0.7.2 からの移行が前提です）'
     )
+    head, version = target()
+    print(f'移行先: {version}（最終位置 {head}）')
     print(
         f'chat テーブル（S）: {size_gb:.2f} GB / DB 全体: {info["db_bytes"] / GB:.2f} GB / chat 列の型: {info["chat_type"]}'
     )
@@ -226,7 +268,9 @@ def cmd_run(args):
         flush=True,
     )
     print('設定: ' + ', '.join(f'{k}={v}' for k, v in info['settings'].items()), flush=True)
-    if info['revision'] == HEAD_REVISION:
+    head, version = target()
+    print(f'移行先: {version}（最終位置 {head}）', flush=True)
+    if info['revision'] == head:
         print('すでに最新です。何もしません。')
         return 0
     if info['revision'] != START_REVISION:
@@ -347,8 +391,9 @@ def cmd_monitor(args):
 def report_check(conn):
     problems = []
     current = revision(conn)
-    print(f'\n== 確認\nマイグレーションの位置: {current}', '（v0.13.3 の最新）' if current == HEAD_REVISION else '')
-    if current != HEAD_REVISION:
+    head, version = target()
+    print(f'\n== 確認\nマイグレーションの位置: {current}', f'（{version} の最新）' if current == head else '')
+    if current != head:
         problems.append('最新まで進んでいない')
     if table_exists(conn, 'chat_message'):
         chats = one(conn, 'SELECT count(*) FROM chat')
