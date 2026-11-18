@@ -1,0 +1,12 @@
+# 実行環境・取り出した 0.7.2 のコード・計測結果・ログは登録しない
+venv072/
+venvnew/
+v072/
+data/
+logs/
+results/
+test-account.env
+.verify_backup/
+.matrix_backup.py
+.env
+.matrix_backup/

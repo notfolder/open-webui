@@ -1,0 +1,1 @@
+emu-ab   shared_buffers=300MB wal_buffers=8MB max_wal_size=1600MB checkpoint_timeout=3min maintenance_work_mem=100MB

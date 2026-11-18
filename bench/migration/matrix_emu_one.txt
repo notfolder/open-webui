@@ -1,0 +1,1 @@
+emu-fin-4800m shared_buffers=1200MB wal_buffers=8MB max_wal_size=6400MB checkpoint_timeout=3min maintenance_work_mem=400MB
